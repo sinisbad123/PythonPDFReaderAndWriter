@@ -1,0 +1,31 @@
+# Ignore all files by default
+*
+
+# But keep these specific files
+!main.py
+!start.sh
+!.gitignore
+
+# Ignore Python cache and compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Ignore PDF files
+*.pdf
+
+# Ignore log files
+*.log
+*.txt
+
+# Ignore OS specific files
+.DS_Store
+Thumbs.db
+
+# Ignore IDE/Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
