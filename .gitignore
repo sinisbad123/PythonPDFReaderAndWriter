@@ -5,6 +5,7 @@
 !main.py
 !start.sh
 !requirements.txt
+!README.md
 !.gitignore
 
 # Ignore Python cache and compiled files
