@@ -171,8 +171,9 @@ def extract_sku_locations_from_pdf(pdf_path):
                     
                     processed_sku_string = re.sub(r'\s+', ' ', processed_sku_string).strip()
 
-                    if '/' in processed_sku_string:
-                        sub_skus = [s.strip() for s in processed_sku_string.split('/') if s.strip()]
+                    if '/' in processed_sku_string or '+' in processed_sku_string:
+                        # Split by both '/' and '+' as separators
+                        sub_skus = [s.strip() for s in re.split(r'[/+]', processed_sku_string) if s.strip()]
                         for sub_sku in sub_skus:
                             current_sku_part_quantity = initial_combined_quantity
                             
