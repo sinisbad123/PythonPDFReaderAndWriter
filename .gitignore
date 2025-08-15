@@ -4,6 +4,7 @@
 # But keep these specific files
 !main.py
 !start.sh
+!requirements.txt
 !.gitignore
 
 # Ignore Python cache and compiled files
@@ -15,9 +16,9 @@ __pycache__/
 # Ignore PDF files
 *.pdf
 
-# Ignore log files
+# Ignore log files (but not requirements.txt)
+logs.txt
 *.log
-*.txt
 
 # Ignore OS specific files
 .DS_Store
