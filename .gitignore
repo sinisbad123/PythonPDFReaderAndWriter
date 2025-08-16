@@ -88,10 +88,10 @@ temp/
 *.7z
 
 # Deployment packages
-pythonanywhere_package/
+deployment/pythonanywhere/pythonanywhere_package/
 
 # Flask templates (generated dynamically)
-templates/
+# Note: src/templates/ is tracked as it contains source templates
 
 # Uploads folder
 uploads/

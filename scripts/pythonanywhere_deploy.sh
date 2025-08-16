@@ -3,8 +3,11 @@ echo "🐍 Setting up PythonAnywhere deployment package..."
 echo "=================================================="
 echo
 
-# Create deployment directory
-DEPLOY_DIR="pythonanywhere_package"
+# Navigate to project root from scripts directory
+cd "$(dirname "$0")/.."
+
+# Create deployment directory in the organized location
+DEPLOY_DIR="deployment/pythonanywhere/pythonanywhere_package"
 if [ -d "$DEPLOY_DIR" ]; then
     echo "🗑️  Removing existing deployment package..."
     rm -rf "$DEPLOY_DIR"
@@ -58,18 +61,13 @@ WSGIEOF
 
 # Copy core application files
 echo "📋 Copying application files..."
-cp main.py "$DEPLOY_DIR/"
-cp flask_app.py "$DEPLOY_DIR/"
+cp src/main.py "$DEPLOY_DIR/"
+cp src/flask_app.py "$DEPLOY_DIR/"
 cp requirements.txt "$DEPLOY_DIR/"
 
 # Copy templates directory
 echo "🌐 Copying web templates..."
-cp -r templates "$DEPLOY_DIR/"
-
-# Copy sample files
-echo "📄 Copying sample files..."
-mkdir -p "$DEPLOY_DIR/sample_files"
-cp sample*.pdf "$DEPLOY_DIR/sample_files/" 2>/dev/null || echo "⚠️  Sample PDFs not found, skipping..."
+cp -r src/templates "$DEPLOY_DIR/"
 
 # Create PythonAnywhere-specific requirements.txt
 echo "📦 Creating PythonAnywhere requirements..."
@@ -120,7 +118,7 @@ cat > "$DEPLOY_DIR/PYTHONANYWHERE_SETUP.md" << 'SETUPEOF'
 ### 5. 🚀 Launch Your App
 1. Click **"Reload"** button in Web tab
 2. Your app will be available at: `https://yourusername.pythonanywhere.com`
-3. **Test it** with the sample PDF files!
+3. **Test it** by uploading a PDF waybill!
 
 ## ⚙️ Important Configuration Notes
 
@@ -255,8 +253,8 @@ chmod +x "$DEPLOY_DIR/pythonanywhere_console_setup.sh"
 # Create a ZIP file for easy upload
 echo "📦 Creating deployment ZIP file..."
 cd "$DEPLOY_DIR"
-zip -r "../pdf_processor_pythonanywhere.zip" . > /dev/null 2>&1
-cd ..
+tar -czf "../../../pdf_processor_pythonanywhere.tar.gz" . > /dev/null 2>&1
+cd ../../..
 
 # Display summary
 echo
@@ -267,10 +265,10 @@ ls -la "$DEPLOY_DIR/"
 echo
 echo "📋 Files created:"
 echo "   📁 $DEPLOY_DIR/ - Complete deployment package"
-echo "   📄 pdf_processor_pythonanywhere.zip - Upload-ready ZIP file"
+echo "   📄 pdf_processor_pythonanywhere.tar.gz - Upload-ready archive"
 echo
 echo "🚀 Next steps:"
-echo "   1. Upload 'pdf_processor_pythonanywhere.zip' to PythonAnywhere"
+echo "   1. Upload 'pdf_processor_pythonanywhere.tar.gz' to PythonAnywhere"
 echo "   2. Extract to /home/yourusername/mysite/"
 echo "   3. Follow instructions in PYTHONANYWHERE_SETUP.md"
 echo "   4. Run pythonanywhere_console_setup.sh in PythonAnywhere console"
