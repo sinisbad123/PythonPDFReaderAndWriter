@@ -7,6 +7,8 @@ import threading
 import webbrowser
 import time
 import json
+import errno
+import fcntl
 from werkzeug.utils import secure_filename
 from main import extract_sku_locations_from_pdf, stamp_skus_on_pdf
 
@@ -14,18 +16,69 @@ app = Flask(__name__)
 app.secret_key = 'your-secret-key-here-change-this'
 app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB max file size
 
-UPLOAD_FOLDER = tempfile.mkdtemp()
+# Create upload folder in a more PythonAnywhere-friendly way
+UPLOAD_FOLDER = os.path.join(os.path.expanduser('~'), 'uploads')
+if not os.path.exists(UPLOAD_FOLDER):
+    os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
 ALLOWED_EXTENSIONS = {'pdf'}
 
 # Global dictionary to track processing status
 processing_status = {}
 
+def safe_file_save(file_obj, filepath, max_retries=3):
+    """Safely save uploaded file with retry logic for PythonAnywhere"""
+    for attempt in range(max_retries):
+        try:
+            # Create directory if it doesn't exist
+            os.makedirs(os.path.dirname(filepath), exist_ok=True)
+            
+            # Save file with explicit binary mode and buffering
+            with open(filepath, 'wb') as f:
+                # Read file in chunks to avoid blocking
+                chunk_size = 8192
+                while True:
+                    chunk = file_obj.read(chunk_size)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    f.flush()  # Force write to disk
+                    os.fsync(f.fileno())  # Ensure data is written
+            
+            # Reset file pointer for potential re-use
+            file_obj.seek(0)
+            return True
+            
+        except (IOError, OSError) as e:
+            if e.errno == errno.EAGAIN or e.errno == errno.EWOULDBLOCK:
+                # Resource temporarily unavailable, retry
+                time.sleep(0.1 * (attempt + 1))
+                continue
+            else:
+                raise e
+        except Exception as e:
+            if attempt == max_retries - 1:
+                raise e
+            time.sleep(0.1 * (attempt + 1))
+    
+    return False
+
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 def process_pdf_background(task_id, filepath, filename):
-    """Process PDF in background thread with progress tracking"""
+    """Process PDF in background thread with progress tracking and robust error handling"""
     try:
+        # Verify input file exists and is readable
+        if not os.path.exists(filepath):
+            processing_status[task_id].update({
+                'status': 'error',
+                'progress': 100,
+                'message': 'Input file not found.',
+                'error': 'Input file not found.'
+            })
+            return
+        
         # Update status: Starting extraction
         processing_status[task_id].update({
             'status': 'extracting',
@@ -33,8 +86,17 @@ def process_pdf_background(task_id, filepath, filename):
             'message': 'Extracting SKU locations from PDF...'
         })
         
-        # Extract SKUs
-        sku_locations = extract_sku_locations_from_pdf(filepath)
+        # Extract SKUs with error handling
+        try:
+            sku_locations = extract_sku_locations_from_pdf(filepath)
+        except Exception as e:
+            processing_status[task_id].update({
+                'status': 'error',
+                'progress': 100,
+                'message': f'Error extracting SKUs: {str(e)}',
+                'error': f'Error extracting SKUs: {str(e)}'
+            })
+            return
         
         if sku_locations is None:
             processing_status[task_id].update({
@@ -82,22 +144,46 @@ def process_pdf_background(task_id, filepath, filename):
             'message': 'Creating output PDF with SKU stamps...'
         })
         
-        # Create output file
+        # Create output file with safer path handling
         base_name = os.path.splitext(filename)[0]
         output_filename = f"{base_name}_SKUs_Qty_EndPage.pdf"
         output_path = os.path.join(UPLOAD_FOLDER, output_filename)
         
-        # Stamp SKUs
-        success = stamp_skus_on_pdf(filepath, sku_locations, output_path, filtered_multi_sku_orders)
+        # Ensure output directory exists
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        
+        # Stamp SKUs with error handling
+        try:
+            success = stamp_skus_on_pdf(filepath, sku_locations, output_path, filtered_multi_sku_orders)
+        except Exception as e:
+            processing_status[task_id].update({
+                'status': 'error',
+                'progress': 100,
+                'message': f'Error creating output PDF: {str(e)}',
+                'error': f'Error creating output PDF: {str(e)}'
+            })
+            return
         
         if success and os.path.exists(output_path):
-            processing_status[task_id].update({
-                'status': 'completed',
-                'progress': 100,
-                'message': f'Successfully processed PDF! Found {len(sku_locations)} SKUs.',
-                'output_path': output_path,
-                'output_filename': output_filename
-            })
+            # Verify output file is readable
+            try:
+                with open(output_path, 'rb') as f:
+                    f.read(1024)  # Try to read first 1KB
+                
+                processing_status[task_id].update({
+                    'status': 'completed',
+                    'progress': 100,
+                    'message': f'Successfully processed PDF! Found {len(sku_locations)} SKUs.',
+                    'output_path': output_path,
+                    'output_filename': output_filename
+                })
+            except Exception as e:
+                processing_status[task_id].update({
+                    'status': 'error',
+                    'progress': 100,
+                    'message': f'Output file created but not readable: {str(e)}',
+                    'error': f'Output file created but not readable: {str(e)}'
+                })
         else:
             processing_status[task_id].update({
                 'status': 'error',
@@ -113,6 +199,13 @@ def process_pdf_background(task_id, filepath, filename):
             'message': f'Error processing PDF: {str(e)}',
             'error': str(e)
         })
+    finally:
+        # Clean up input file after processing
+        try:
+            if os.path.exists(filepath):
+                os.remove(filepath)
+        except Exception:
+            pass  # Ignore cleanup errors
 
 @app.route('/')
 def index():
@@ -143,7 +236,15 @@ def upload_file():
     if file and allowed_file(file.filename):
         filename = secure_filename(file.filename)
         filepath = os.path.join(UPLOAD_FOLDER, filename)
-        file.save(filepath)
+        
+        # Use safe file saving method
+        try:
+            if not safe_file_save(file, filepath):
+                flash('Failed to save uploaded file. Please try again.', 'error')
+                return redirect(url_for('index'))
+        except Exception as e:
+            flash(f'Error saving file: {str(e)}', 'error')
+            return redirect(url_for('index'))
         
         # Generate a unique task ID
         import uuid

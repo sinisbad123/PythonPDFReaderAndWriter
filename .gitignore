@@ -80,6 +80,16 @@ logs.txt
 tmp/
 temp/
 
+# Archive files
+*.tar.gz
+*.zip
+*.tar
+*.rar
+*.7z
+
+# Deployment packages
+pythonanywhere_package/
+
 # Flask templates (generated dynamically)
 templates/
 
