@@ -75,9 +75,9 @@ def extract_sku_locations_from_pdf(pdf_path):
             if order_id == "UNKNOWN_ORDER" and page_num > 0:
                 prev_order_id = page_order_ids[page_num - 1]
                 if prev_order_id != "UNKNOWN_ORDER":
-                    # Check if previous page had a 'Payment' and current one doesn't,
+                    # Check if previous page had a 'Weight:' and current one doesn't,
                     # to confirm it's a two-page order split.
-                    if "Payment" in doc.load_page(page_num - 1).get_text() and "Payment" not in page.get_text():
+                    if "Weight:" in doc.load_page(page_num - 1).get_text() and "Weight:" not in page.get_text():
                         order_id = prev_order_id
                         print(f"  Info: Assigning Order ID '{order_id}' from page {page_num} to SKUs on page {page_num + 1}.")
 
@@ -755,8 +755,8 @@ def stamp_skus_on_pdf(input_pdf_path, sku_locations, output_pdf_path, multi_sku_
                     current_page_text = doc.load_page(page_num).get_text()
                     next_page_text = doc.load_page(page_num + 1).get_text()
                     
-                    # Check if current page has "Payment" and next page doesn't
-                    if "Payment" in current_page_text and "Payment" not in next_page_text:
+                    # Check if current page has "Weight:" and next page doesn't
+                    if "Weight:" in current_page_text and "Weight:" not in next_page_text:
                         is_two_page_order = True
                         
                         # Add SKUs from the next page to the combined aggregation
@@ -1090,7 +1090,7 @@ def main(file_name=None):
     print("      Any leading or trailing dashes or underscores will be removed from the SKU text after number removal.")
     print("      Quantity will now ONLY be searched to the right of the SKU, on the same line or slightly below (vertical range increased to 40 points).")
     print("      All identified SKUs for a page will be stamped together at the page's bottom-left.")
-    print("      Orders spanning two pages (current page has 'Payment', next page does not) will have SKUs from the first page moved to the second page for stamping.")
+    print("      Orders spanning two pages (current page has 'Weight:', next page does not) will have SKUs from the first page moved to the second page for stamping.")
     print("      Quantities for identical SKUs on the same page will now be summed and displayed as a single entry.")
     print("      A new summary page will be added at the end of the PDF, listing all unique SKUs and their total quantities across the entire file.")
     print("      SKU aliases 'WASH-L' will be treated as 'BWL' and 'WASH-M' as 'BWM' before stamping and aggregation.")
