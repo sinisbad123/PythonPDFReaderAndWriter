@@ -53,7 +53,7 @@ A professional PDF processing tool that extracts SKU information from TikTok way
 Process PDFs directly from the command line:
 
 ```bash
-python src/main.py input_file.pdf
+python3 src/main.py input_file.pdf
 ```
 
 Output files will be generated with `_stamped` suffix.
@@ -66,7 +66,7 @@ Launch the web interface for easy drag-and-drop processing:
 ./scripts/start.sh
 
 # Or directly
-python src/flask_app.py
+python3 src/flask_app.py
 ```
 
 Then open your browser to `http://localhost:5000`
