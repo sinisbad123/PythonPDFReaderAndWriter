@@ -2,11 +2,77 @@ import fitz # PyMuPDF
 import re
 import os
 import sys
+import time
+import errno
+
+def safe_file_save(doc, output_path, max_retries=5):
+    """
+    Safely save a PDF document with retry logic for PythonAnywhere compatibility.
+
+    Args:
+        doc: PyMuPDF document object
+        output_path: Path where to save the file
+        max_retries: Maximum number of retry attempts
+
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    for attempt in range(max_retries):
+        try:
+            # Ensure the output directory exists
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+            # Try to save the document
+            doc.save(output_path)
+            return True
+
+        except OSError as e:
+            if e.errno == errno.EAGAIN or "would block" in str(e):
+                print(f"Save attempt {attempt + 1} failed (resource temporarily unavailable), retrying in {0.5 * (attempt + 1)} seconds...")
+                time.sleep(0.5 * (attempt + 1))  # Exponential backoff
+                continue
+            else:
+                print(f"Save failed with error: {e}")
+                return False
+        except Exception as e:
+            print(f"Unexpected error during save: {e}")
+            return False
+
+    print(f"Failed to save file after {max_retries} attempts")
+    return False
+
+def safe_pdf_operation(operation_func, max_retries=3, *args, **kwargs):
+    """
+    Safely execute PDF operations with retry logic for PythonAnywhere compatibility.
+
+    Args:
+        operation_func: The function to execute
+        max_retries: Maximum number of retry attempts
+        *args, **kwargs: Arguments to pass to the operation function
+
+    Returns:
+        The result of the operation or None if all retries failed
+    """
+    for attempt in range(max_retries):
+        try:
+            return operation_func(*args, **kwargs)
+        except OSError as e:
+            if e.errno == errno.EAGAIN or "would block" in str(e) or "write could not complete" in str(e):
+                if attempt < max_retries - 1:  # Don't sleep on the last attempt
+                    print(f"PDF operation attempt {attempt + 1} failed (resource temporarily unavailable), retrying in {0.5 * (attempt + 1)} seconds...")
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+            raise  # Re-raise if it's not a blocking error or we've exhausted retries
+        except Exception as e:
+            # For other exceptions, don't retry
+            raise
+    return None
 
 def extract_sku_locations_from_pdf(pdf_path):
     """
     Extracts all text from a PDF and identifies the locations of SKU codes and their quantities,
     correctly associating them with their Order ID, especially for two-page orders.
+    Memory-optimized for large files on PythonAnywhere free tier.
 
     Args:
         pdf_path (str): The path to the PDF file.
@@ -17,9 +83,18 @@ def extract_sku_locations_from_pdf(pdf_path):
               Returns None if the file cannot be opened or processed.
     """
     try:
-        doc = fitz.open(pdf_path)
+        doc = safe_pdf_operation(fitz.open, 3, pdf_path)
+        if doc is None:
+            print(f"Failed to open PDF after multiple attempts: {pdf_path}")
+            return None
         num_pages = doc.page_count
         print(f"Reading {num_pages} page(s) from '{os.path.basename(pdf_path)}' to find SKUs and Quantities...")
+
+        # Memory optimization: Process in smaller batches for large files
+        batch_size = 10 if num_pages > 50 else num_pages
+        if num_pages > 100:
+            batch_size = 5  # Even smaller batches for very large files
+        print(f"Processing in batches of {batch_size} pages to optimize memory usage...")
 
         # Regex to find Order ID
         order_id_regex = re.compile(r'Order ID:\s*(\d+)', re.IGNORECASE)
@@ -48,16 +123,37 @@ def extract_sku_locations_from_pdf(pdf_path):
             "CBV": "CBV"
         }
 
-        # First pass: Extract all text and find Order IDs per page
+        # First pass: Extract all text and find Order IDs per page (memory optimized)
         page_order_ids = {}
-        for page_num in range(num_pages):
-            page = doc.load_page(page_num)
-            page_text = page.get_text()
-            order_id_match = order_id_regex.search(page_text)
-            if order_id_match:
-                page_order_ids[page_num] = order_id_match.group(1)
-            else:
-                page_order_ids[page_num] = "UNKNOWN_ORDER"
+
+        # Process pages in batches to reduce memory usage
+        for batch_start in range(0, num_pages, batch_size):
+            batch_end = min(batch_start + batch_size, num_pages)
+            print(f"Processing Order IDs for pages {batch_start + 1}-{batch_end}...")
+
+            for page_num in range(batch_start, batch_end):
+                page = safe_pdf_operation(doc.load_page, 3, page_num)
+                if page is None:
+                    print(f"Failed to load page {page_num + 1} after multiple attempts, skipping...")
+                    continue
+
+                page_text = safe_pdf_operation(page.get_text, 3)
+                if page_text is None:
+                    print(f"Failed to get text from page {page_num + 1} after multiple attempts, skipping...")
+                    page = None
+                    continue
+                order_id_match = order_id_regex.search(page_text)
+                if order_id_match:
+                    page_order_ids[page_num] = order_id_match.group(1)
+                else:
+                    page_order_ids[page_num] = "UNKNOWN_ORDER"
+
+                # Free memory immediately after processing each page
+                page = None
+
+            # Force garbage collection after each batch
+            import gc
+            gc.collect()
 
         print("\n--- Identified Order IDs per page ---")
         for page_num, order_id in page_order_ids.items():
@@ -65,184 +161,212 @@ def extract_sku_locations_from_pdf(pdf_path):
         print("---------------------------------------")
 
         sku_locations = []
-        for page_num in range(num_pages):
-            page = doc.load_page(page_num)
-            words = page.get_text("words")
-            
-            # Get the correct Order ID for the current page
-            order_id = page_order_ids[page_num]
-            # Handle two-page orders by checking the previous page's Order ID
-            if order_id == "UNKNOWN_ORDER" and page_num > 0:
-                prev_order_id = page_order_ids[page_num - 1]
-                if prev_order_id != "UNKNOWN_ORDER":
-                    # Check if previous page had a 'Weight:' and current one doesn't,
-                    # to confirm it's a two-page order split.
-                    if "Weight:" in doc.load_page(page_num - 1).get_text() and "Weight:" not in page.get_text():
-                        order_id = prev_order_id
-                        print(f"  Info: Assigning Order ID '{order_id}' from page {page_num} to SKUs on page {page_num + 1}.")
 
-            idx = 0
-            while idx < len(words):
-                x0, y0, x1, y1, word_text, _, _, _ = words[idx]
+        # Second pass: Extract SKUs in batches for memory efficiency
+        for batch_start in range(0, num_pages, batch_size):
+            batch_end = min(batch_start + batch_size, num_pages)
+            print(f"Extracting SKUs from pages {batch_start + 1}-{batch_end}...")
 
-                initial_match = initial_c_sku_regex.search(word_text)
-                
-                if initial_match:
-                    current_sku_parts = [word_text.strip()]
-                    current_sku_bbox = fitz.Rect(x0, y0, x1, y1)
-                    
-                    look_ahead_idx = idx + 1
-                    while look_ahead_idx < len(words) and \
-                          look_ahead_idx < idx + MAX_WORDS_TO_LOOK_AHEAD_FOR_SKU_NAME:
-                        
-                        next_word_info = words[look_ahead_idx]
-                        nox0, noy0, nox1, noy1, next_word_text, _, _, _ = next_word_info
+            for page_num in range(batch_start, batch_end):
+                page = safe_pdf_operation(doc.load_page, 3, page_num)
+                if page is None:
+                    print(f"Failed to load page {page_num + 1} after multiple attempts, skipping...")
+                    continue
 
-                        if abs(noy0 - y0) <= QUANTITY_SEARCH_RANGE_Y and \
-                           (nox0 - x0) < X_MULTIPLIER_SEARCH_RANGE_X + 50 and \
-                           not quantity_regex.search(next_word_text.strip()):
-                            
-                            current_sku_parts.append(next_word_text.strip())
-                            current_sku_bbox = current_sku_bbox | fitz.Rect(nox0, noy0, nox1, noy1)
-                            look_ahead_idx += 1
-                        else:
-                            break
+                words = safe_pdf_operation(page.get_text, 3, "words")
+                if words is None:
+                    print(f"Failed to get words from page {page_num + 1} after multiple attempts, skipping...")
+                    page = None
+                    continue
 
-                    sku_found_raw = " ".join(current_sku_parts).strip()
-                    
-                    base_quantity = 1
-                    x_multiplier_value = 1
+                # Get the correct Order ID for the current page
+                order_id = page_order_ids[page_num]
+                # Handle two-page orders by checking the previous page's Order ID
+                if order_id == "UNKNOWN_ORDER" and page_num > 0:
+                    prev_order_id = page_order_ids[page_num - 1]
+                    if prev_order_id != "UNKNOWN_ORDER":
+                        # Check if previous page had a 'Weight:' and current one doesn't,
+                        # to confirm it's a two-page order split.
+                        prev_page = safe_pdf_operation(doc.load_page, 3, page_num - 1)
+                        if prev_page is not None:
+                            current_page_text = safe_pdf_operation(page.get_text, 3)
+                            prev_page_text = safe_pdf_operation(prev_page.get_text, 3)
+                            if (current_page_text is not None and prev_page_text is not None and
+                                "Weight:" in prev_page_text and "Weight:" not in current_page_text):
+                                order_id = prev_order_id
+                                print(f"  Info: Assigning Order ID '{order_id}' from page {page_num} to SKUs on page {page_num + 1}.")
+                            prev_page = None  # Free memory
 
-                    temp_sku_string = sku_found_raw
-                    x_match_in_sku = x_multiplier_regex.search(temp_sku_string)
-                    if x_match_in_sku:
-                        try:
-                            x_multiplier_value = int(x_match_in_sku.group(1))
-                            temp_sku_string = x_multiplier_regex.sub('', temp_sku_string).strip()
-                        except ValueError:
-                            pass
-                    
-                    found_base_qty_for_current_sku = False
-                    qty_search_start_idx = look_ahead_idx 
-                    for j in range(qty_search_start_idx, len(words)):
-                        other_word_info = words[j]
-                        ox0, oy0, ox1, oy1, other_word_text, _, _, _ = other_word_info
+                idx = 0
+                while idx < len(words):
+                    x0, y0, x1, y1, word_text, _, _, _ = words[idx]
 
-                        if (oy0 >= current_sku_bbox.y0 and abs(oy0 - current_sku_bbox.y0) <= QUANTITY_SEARCH_RANGE_Y and
-                            ox0 > current_sku_bbox.x1 and (ox0 - current_sku_bbox.x1) <= QUANTITY_SEARCH_RANGE_X):
-                            
-                            qty_match = quantity_regex.search(other_word_text.strip())
-                            if qty_match:
-                                try:
-                                    potential_qty = int(qty_match.group(0))
-                                    if 0 < potential_qty < 1000:
-                                        base_quantity = potential_qty
-                                        found_base_qty_for_current_sku = True
+                    initial_match = initial_c_sku_regex.search(word_text)
+
+                    if initial_match:
+                        current_sku_parts = [word_text.strip()]
+                        current_sku_bbox = fitz.Rect(x0, y0, x1, y1)
+
+                        look_ahead_idx = idx + 1
+                        while look_ahead_idx < len(words) and \
+                              look_ahead_idx < idx + MAX_WORDS_TO_LOOK_AHEAD_FOR_SKU_NAME:
+
+                            next_word_info = words[look_ahead_idx]
+                            nox0, noy0, nox1, noy1, next_word_text, _, _, _ = next_word_info
+
+                            if abs(noy0 - y0) <= QUANTITY_SEARCH_RANGE_Y and \
+                               (nox0 - x0) < X_MULTIPLIER_SEARCH_RANGE_X + 50 and \
+                               not quantity_regex.search(next_word_text.strip()):
+
+                                current_sku_parts.append(next_word_text.strip())
+                                current_sku_bbox = current_sku_bbox | fitz.Rect(nox0, noy0, nox1, noy1)
+                                look_ahead_idx += 1
+                            else:
+                                break
+
+                        sku_found_raw = " ".join(current_sku_parts).strip()
+
+                        base_quantity = 1
+                        x_multiplier_value = 1
+
+                        temp_sku_string = sku_found_raw
+                        x_match_in_sku = x_multiplier_regex.search(temp_sku_string)
+                        if x_match_in_sku:
+                            try:
+                                x_multiplier_value = int(x_match_in_sku.group(1))
+                                temp_sku_string = x_multiplier_regex.sub('', temp_sku_string).strip()
+                            except ValueError:
+                                pass
+
+                        found_base_qty_for_current_sku = False
+                        qty_search_start_idx = look_ahead_idx
+                        for j in range(qty_search_start_idx, len(words)):
+                            other_word_info = words[j]
+                            ox0, oy0, ox1, oy1, other_word_text, _, _, _ = other_word_info
+
+                            if (oy0 >= current_sku_bbox.y0 and abs(oy0 - current_sku_bbox.y0) <= QUANTITY_SEARCH_RANGE_Y and
+                                ox0 > current_sku_bbox.x1 and (ox0 - current_sku_bbox.x1) <= QUANTITY_SEARCH_RANGE_X):
+
+                                qty_match = quantity_regex.search(other_word_text.strip())
+                                if qty_match:
+                                    try:
+                                        potential_qty = int(qty_match.group(0))
+                                        if 0 < potential_qty < 1000:
+                                            base_quantity = potential_qty
+                                            found_base_qty_for_current_sku = True
+                                            break
+                                    except ValueError:
+                                        pass
+                            elif (ox0 - current_sku_bbox.x1) > QUANTITY_SEARCH_RANGE_X + 50:
+                                break
+
+                        xN_search_start_idx = qty_search_start_idx
+                        for j in range(xN_search_start_idx, len(words)):
+                            other_word_info = words[j]
+                            ox0, oy0, ox1, oy1, other_word_text, _, _, _ = other_word_info
+
+                            if (oy0 >= current_sku_bbox.y0 and abs(oy0 - current_sku_bbox.y0) <= X_MULTIPLIER_SAME_LINE_Y_RANGE and
+                                ox0 > current_sku_bbox.x1 and (ox0 - current_sku_bbox.x1) <= X_MULTIPLIER_SEARCH_RANGE_X):
+
+                                x_match_external = x_multiplier_regex.search(other_word_text.strip())
+                                if x_match_external:
+                                    try:
+                                        x_multiplier_value *= int(x_match_external.group(1))
                                         break
-                                except ValueError:
-                                    pass
-                        elif (ox0 - current_sku_bbox.x1) > QUANTITY_SEARCH_RANGE_X + 50:
-                            break
-                    
-                    xN_search_start_idx = qty_search_start_idx 
-                    for j in range(xN_search_start_idx, len(words)):
-                        other_word_info = words[j]
-                        ox0, oy0, ox1, oy1, other_word_text, _, _, _ = other_word_info
+                                    except ValueError:
+                                        pass
+                            elif (ox0 - current_sku_bbox.x1) > X_MULTIPLIER_SEARCH_RANGE_X + 50:
+                                break
 
-                        if (oy0 >= current_sku_bbox.y0 and abs(oy0 - current_sku_bbox.y0) <= X_MULTIPLIER_SAME_LINE_Y_RANGE and
-                            ox0 > current_sku_bbox.x1 and (ox0 - current_sku_bbox.x1) <= X_MULTIPLIER_SEARCH_RANGE_X):
-                            
-                            x_match_external = x_multiplier_regex.search(other_word_text.strip())
-                            if x_match_external:
-                                try:
-                                    x_multiplier_value *= int(x_match_external.group(1))
-                                    break
-                                except ValueError:
-                                    pass
-                        elif (ox0 - current_sku_bbox.x1) > X_MULTIPLIER_SEARCH_RANGE_X + 50:
-                            break
-                    
-                    initial_combined_quantity = base_quantity * x_multiplier_value
-                    processed_sku_string = temp_sku_string
-                    if processed_sku_string.startswith("C_"):
-                        processed_sku_string = processed_sku_string[2:]
-                    elif processed_sku_string.startswith("C "):
-                        processed_sku_string = processed_sku_string[2:]
-                    
-                    processed_sku_string = re.sub(r'\s+', ' ', processed_sku_string).strip()
+                        initial_combined_quantity = base_quantity * x_multiplier_value
+                        processed_sku_string = temp_sku_string
+                        if processed_sku_string.startswith("C_"):
+                            processed_sku_string = processed_sku_string[2:]
+                        elif processed_sku_string.startswith("C "):
+                            processed_sku_string = processed_sku_string[2:]
 
-                    if '/' in processed_sku_string or '+' in processed_sku_string:
-                        # Split by both '/' and '+' as separators
-                        sub_skus = [s.strip() for s in re.split(r'[/+]', processed_sku_string) if s.strip()]
-                        for sub_sku in sub_skus:
-                            current_sku_part_quantity = initial_combined_quantity
-                            
-                            stripped_sub_sku = sub_sku.strip()
-                            match_end_number = number_at_end_of_sku_part_regex.search(stripped_sub_sku)
+                        processed_sku_string = re.sub(r'\s+', ' ', processed_sku_string).strip()
+
+                        if '/' in processed_sku_string or '+' in processed_sku_string:
+                            # Split by both '/' and '+' as separators
+                            sub_skus = [s.strip() for s in re.split(r'[/+]', processed_sku_string) if s.strip()]
+                            for sub_sku in sub_skus:
+                                current_sku_part_quantity = initial_combined_quantity
+
+                                stripped_sub_sku = sub_sku.strip()
+                                match_end_number = number_at_end_of_sku_part_regex.search(stripped_sub_sku)
+                                if match_end_number:
+                                    num_at_end_str = match_end_number.group(1)
+                                    try:
+                                        num_at_end_int = int(num_at_end_str)
+                                        current_sku_part_quantity *= num_at_end_int
+                                        sub_sku = stripped_sub_sku[:-len(num_at_end_str)].strip('_-')
+                                    except ValueError:
+                                        sub_sku = stripped_sub_sku.strip('-')
+                                else:
+                                    sub_sku = stripped_sub_sku.strip('-')
+
+                                if "B1T1" in sub_sku.upper():
+                                    sub_sku = sub_sku.replace("B1T1", "").replace("b1t1", "").strip('_-')
+                                    current_sku_part_quantity *= 2
+
+                                normalized_sku_for_lookup = re.sub(r'[\s\-]+', ' ', sub_sku).strip().upper()
+                                for original_key, alias_value in sku_aliases.items():
+                                    if normalized_sku_for_lookup == re.sub(r'[\s\-]+', ' ', original_key).strip().upper():
+                                        sub_sku = alias_value
+                                        break
+
+                                sku_locations.append({
+                                    'sku': sub_sku,
+                                    'quantity': current_sku_part_quantity,
+                                    'page_num': page_num,
+                                    'bbox': current_sku_bbox,
+                                    'order_id': order_id
+                                })
+                        else:
+                            current_sku_quantity = initial_combined_quantity
+
+                            stripped_sku_text = processed_sku_string.strip()
+                            match_end_number = number_at_end_of_sku_part_regex.search(stripped_sku_text)
                             if match_end_number:
                                 num_at_end_str = match_end_number.group(1)
                                 try:
                                     num_at_end_int = int(num_at_end_str)
-                                    current_sku_part_quantity *= num_at_end_int
-                                    sub_sku = stripped_sub_sku[:-len(num_at_end_str)].strip('_-')
+                                    current_sku_quantity *= num_at_end_int
+                                    processed_sku_string = stripped_sku_text[:-len(num_at_end_str)].strip('_-')
                                 except ValueError:
-                                    sub_sku = stripped_sub_sku.strip('-')
+                                    processed_sku_string = stripped_sku_text.strip('-')
                             else:
-                                sub_sku = stripped_sub_sku.strip('-')
+                                processed_sku_string = stripped_sku_text.strip('-')
 
-                            if "B1T1" in sub_sku.upper():
-                                sub_sku = sub_sku.replace("B1T1", "").replace("b1t1", "").strip('_-')
-                                current_sku_part_quantity *= 2
+                            if "B1T1" in processed_sku_string.upper():
+                                processed_sku_string = processed_sku_string.replace("B1T1", "").replace("b1t1", "").strip('_-')
+                                current_sku_quantity *= 2
 
-                            normalized_sku_for_lookup = re.sub(r'[\s\-]+', ' ', sub_sku).strip().upper()
+                            normalized_sku_for_lookup = re.sub(r'[\s\-]+', ' ', processed_sku_string).strip().upper()
                             for original_key, alias_value in sku_aliases.items():
                                 if normalized_sku_for_lookup == re.sub(r'[\s\-]+', ' ', original_key).strip().upper():
-                                    sub_sku = alias_value
+                                    processed_sku_string = alias_value
                                     break
 
                             sku_locations.append({
-                                'sku': sub_sku,
-                                'quantity': current_sku_part_quantity,
+                                'sku': processed_sku_string,
+                                'quantity': current_sku_quantity,
                                 'page_num': page_num,
                                 'bbox': current_sku_bbox,
                                 'order_id': order_id
                             })
+                        idx = look_ahead_idx
                     else:
-                        current_sku_quantity = initial_combined_quantity
-                        
-                        stripped_sku_text = processed_sku_string.strip()
-                        match_end_number = number_at_end_of_sku_part_regex.search(stripped_sku_text)
-                        if match_end_number:
-                            num_at_end_str = match_end_number.group(1)
-                            try:
-                                num_at_end_int = int(num_at_end_str)
-                                current_sku_quantity *= num_at_end_int
-                                processed_sku_string = stripped_sku_text[:-len(num_at_end_str)].strip('_-')
-                            except ValueError:
-                                processed_sku_string = stripped_sku_text.strip('-')
-                        else:
-                            processed_sku_string = stripped_sku_text.strip('-')
+                        idx += 1
 
-                        if "B1T1" in processed_sku_string.upper():
-                            processed_sku_string = processed_sku_string.replace("B1T1", "").replace("b1t1", "").strip('_-')
-                            current_sku_quantity *= 2
+            # Free memory for page objects after processing each page (move outside the while loop)
+            page = None
+            words = None
 
-                        normalized_sku_for_lookup = re.sub(r'[\s\-]+', ' ', processed_sku_string).strip().upper()
-                        for original_key, alias_value in sku_aliases.items():
-                            if normalized_sku_for_lookup == re.sub(r'[\s\-]+', ' ', original_key).strip().upper():
-                                processed_sku_string = alias_value
-                                break
-
-                        sku_locations.append({
-                            'sku': processed_sku_string,
-                            'quantity': current_sku_quantity,
-                            'page_num': page_num,
-                            'bbox': current_sku_bbox,
-                            'order_id': order_id
-                        })
-                    idx = look_ahead_idx
-                else:
-                    idx += 1
+        # Force garbage collection after each batch
+        import gc
+        gc.collect()
 
         doc.close()
     except FileNotFoundError:
@@ -256,11 +380,25 @@ def extract_sku_locations_from_pdf(pdf_path):
 def stamp_skus_on_pdf(input_pdf_path, sku_locations, output_pdf_path, multi_sku_orders_to_stamp):
     """
     Stamps the identified SKU codes and their quantities onto a new PDF document,
-    including a summary page at the end.
+    including a summary page at the end. Memory-optimized for large files.
     """
     try:
-        doc = fitz.open(input_pdf_path)
-        output_doc = fitz.open()
+        doc = safe_pdf_operation(fitz.open, 3, input_pdf_path)
+        if doc is None:
+            print(f"Failed to open input PDF after multiple attempts: {input_pdf_path}")
+            return False
+
+        output_doc = safe_pdf_operation(fitz.open, 3)
+        if output_doc is None:
+            print("Failed to create output PDF after multiple attempts")
+            return False
+
+        # Memory optimization: Process pages in batches
+        total_pages = doc.page_count
+        batch_size = 10 if total_pages > 50 else total_pages
+        if total_pages > 100:
+            batch_size = 5
+        print(f"Stamping PDFs in batches of {batch_size} pages for memory optimization...")
 
         font_name = "helv"
         font_size = 12
@@ -275,87 +413,119 @@ def stamp_skus_on_pdf(input_pdf_path, sku_locations, output_pdf_path, multi_sku_
                 skus_by_page[page_num] = []
             skus_by_page[page_num].append(sku_info)
 
-        for page_num in range(doc.page_count):
-            page = doc.load_page(page_num)
-            output_page = output_doc.new_page(
-                width=page.rect.width,
-                height=page.rect.height
-            )
-            output_page.show_pdf_page(page.rect, doc, page_num)
+        # Process pages in batches to reduce memory usage
+        for batch_start in range(0, total_pages, batch_size):
+            batch_end = min(batch_start + batch_size, total_pages)
+            print(f"Processing PDF pages {batch_start + 1}-{batch_end}...")
 
-            bottom_margin = 20
-            left_margin = 20
+            for page_num in range(batch_start, batch_end):
+                page = safe_pdf_operation(doc.load_page, 3, page_num)
+                if page is None:
+                    print(f"Failed to load page {page_num + 1} for stamping after multiple attempts, skipping...")
+                    continue
 
-            page_aggregated_skus = {}
+                output_page = safe_pdf_operation(output_doc.new_page, 3,
+                    width=page.rect.width, height=page.rect.height)
+                if output_page is None:
+                    print(f"Failed to create output page {page_num + 1} after multiple attempts, skipping...")
+                    page = None
+                    continue
 
-            if page_num in skus_by_page:
-                for sku_info in skus_by_page[page_num]:
-                    sku_text = sku_info['sku']
-                    sku_quantity = sku_info['quantity']
-
-                    if sku_text in page_aggregated_skus:
-                        page_aggregated_skus[sku_text] += sku_quantity
-                    else:
-                        page_aggregated_skus[sku_text] = sku_quantity
-                    
-                    if sku_text in global_aggregated_skus:
-                        global_aggregated_skus[sku_text] += sku_quantity
-                    else:
-                        global_aggregated_skus[sku_text] = sku_quantity
-
-            final_skus_to_stamp_on_this_page = []
-            for sku, total_qty in page_aggregated_skus.items():
-                final_skus_to_stamp_on_this_page.append(f"{sku} (x{total_qty})")
-            
-            final_skus_to_stamp_on_this_page.sort()
-
-            if final_skus_to_stamp_on_this_page:
-                final_text_to_stamp = "\n".join(final_skus_to_stamp_on_this_page)
-
-                max_line_width = 0
-                num_lines = 0
-                
+                # Use safe operation for showing PDF page
                 try:
-                    lines = final_text_to_stamp.split('\n')
-                    if lines:
-                        max_line_width = max(fitz.get_text_length(line, fontname=font_name, fontsize=font_size) for line in lines)
-                    num_lines = len(lines)
+                    safe_pdf_operation(output_page.show_pdf_page, 3, page.rect, doc, page_num)
                 except Exception as e:
-                    print(f"Warning: Error calculating text dimensions: {e}. Using default size for background.")
-                    max_line_width = 100
-                    num_lines = 1
+                    print(f"Failed to copy page {page_num + 1} content after multiple attempts: {e}")
+                    page = None
+                    continue
 
-                padding_x = 10
-                padding_y = 5
+                bottom_margin = 20
+                left_margin = 20
 
-                background_width = max_line_width + (2 * padding_x)
-                background_height = (num_lines * font_size * 1.4) + (2 * padding_y)
+                page_aggregated_skus = {}
 
-                rect_x0 = left_margin
-                rect_x1 = rect_x0 + background_width
+                if page_num in skus_by_page:
+                    for sku_info in skus_by_page[page_num]:
+                        sku_text = sku_info['sku']
+                        sku_quantity = sku_info['quantity']
 
-                rect_y1 = output_page.rect.height - bottom_margin
-                rect_y0 = rect_y1 - background_height
+                        if sku_text in page_aggregated_skus:
+                            page_aggregated_skus[sku_text] += sku_quantity
+                        else:
+                            page_aggregated_skus[sku_text] = sku_quantity
 
-                background_rect = fitz.Rect(rect_x0, rect_y0, rect_x1, rect_y1)
+                        if sku_text in global_aggregated_skus:
+                            global_aggregated_skus[sku_text] += sku_quantity
+                        else:
+                            global_aggregated_skus[sku_text] = sku_quantity
 
-                output_page.draw_rect(background_rect, color=(0.8, 0.8, 0.8), fill=(0.8, 0.8, 0.8))
+                final_skus_to_stamp_on_this_page = []
+                for sku, total_qty in page_aggregated_skus.items():
+                    final_skus_to_stamp_on_this_page.append(f"{sku} (x{total_qty})")
 
-                text_insert_x = rect_x0 + padding_x
-                text_insert_y = rect_y0 + padding_y + font_size
+                final_skus_to_stamp_on_this_page.sort()
 
-                output_page.insert_text(
-                    fitz.Point(text_insert_x, text_insert_y),
-                    final_text_to_stamp,
-                    fontname=font_name,
-                    fontsize=font_size,
-                    color=(0, 0, 0),
-                    set_simple=True
-                )
-        
-        first_page_dims = doc.load_page(0).rect
-        page_width = first_page_dims.width
-        page_height = first_page_dims.height
+                if final_skus_to_stamp_on_this_page:
+                    final_text_to_stamp = "\n".join(final_skus_to_stamp_on_this_page)
+
+                    max_line_width = 0
+                    num_lines = 0
+
+                    try:
+                        lines = final_text_to_stamp.split('\n')
+                        if lines:
+                            max_line_width = max(fitz.get_text_length(line, fontname=font_name, fontsize=font_size) for line in lines)
+                        num_lines = len(lines)
+                    except Exception as e:
+                        print(f"Warning: Error calculating text dimensions: {e}. Using default size for background.")
+                        max_line_width = 100
+                        num_lines = 1
+
+                    padding_x = 10
+                    padding_y = 5
+
+                    background_width = max_line_width + (2 * padding_x)
+                    background_height = (num_lines * font_size * 1.4) + (2 * padding_y)
+
+                    rect_x0 = left_margin
+                    rect_x1 = rect_x0 + background_width
+
+                    rect_y1 = output_page.rect.height - bottom_margin
+                    rect_y0 = rect_y1 - background_height
+
+                    background_rect = fitz.Rect(rect_x0, rect_y0, rect_x1, rect_y1)
+
+                    output_page.draw_rect(background_rect, color=(0.8, 0.8, 0.8), fill=(0.8, 0.8, 0.8))
+
+                    text_insert_x = rect_x0 + padding_x
+                    text_insert_y = rect_y0 + padding_y + font_size
+
+                    output_page.insert_text(
+                        fitz.Point(text_insert_x, text_insert_y),
+                        final_text_to_stamp,
+                        fontname=font_name,
+                        fontsize=font_size,
+                        color=(0, 0, 0),
+                        set_simple=True
+                    )
+
+                # Free memory after processing each page
+                page = None
+
+            # Force garbage collection after each batch
+            import gc
+            gc.collect()
+
+        first_page = safe_pdf_operation(doc.load_page, 3, 0)
+        if first_page is None:
+            print("Failed to load first page for dimensions, using default values")
+            page_width = 595  # Default A4 width
+            page_height = 842  # Default A4 height
+        else:
+            first_page_dims = first_page.rect
+            page_width = first_page_dims.width
+            page_height = first_page_dims.height
+            first_page = None  # Free memory
         summary_padding_x = 10
         summary_padding_y = 10
         top_margin_summary = 20
@@ -364,7 +534,7 @@ def stamp_skus_on_pdf(input_pdf_path, sku_locations, output_pdf_path, multi_sku_
         def add_new_summary_page_content(page_obj, lines_to_stamp, title="", dynamic_font_sizing_enabled=False, position_top=False):
             content_elements_info = []
             max_content_width_on_page = 0
-            
+
             max_width_for_text_area = page_width - (2 * left_margin) - (2 * summary_padding_x)
 
             if title:
@@ -373,32 +543,32 @@ def stamp_skus_on_pdf(input_pdf_path, sku_locations, output_pdf_path, multi_sku_
                 while title_text_width > max_width_for_text_area and title_font_size_actual > MIN_FONT_SIZE:
                     title_font_size_actual -= 0.5
                     title_text_width = fitz.get_text_length(title, fontname=font_name, fontsize=title_font_size_actual)
-                
+
                 content_elements_info.append((title, title_font_size_actual, title_font_size_actual * 1.8))
                 max_content_width_on_page = max(max_content_width_on_page, title_text_width)
-            
+
             for line in lines_to_stamp:
                 current_line_font_size = font_size
-                
+
                 # Check if line needs to be split due to width
                 text_width = fitz.get_text_length(line, fontname=font_name, fontsize=current_line_font_size)
-                
+
                 # Add extra width for bullet points if this line has a bullet
                 if line.startswith("● "):
                     bullet_space = 15  # Space for bullet circle (3 radius + 2 margin + 6 spacing)
                     text_width += bullet_space
-                
+
                 if text_width > max_width_for_text_area:
                     # Split long lines by breaking at " / " separators or spaces
                     if " / " in line:
                         # Split at SKU separators first
                         parts = line.split(" / ")
                         current_line_parts = []
-                        
+
                         for part in parts:
                             test_line = " / ".join(current_line_parts + [part])
                             test_width = fitz.get_text_length(test_line, fontname=font_name, fontsize=current_line_font_size)
-                            
+
                             if test_width <= max_width_for_text_area:
                                 current_line_parts.append(part)
                             else:
@@ -410,10 +580,10 @@ def stamp_skus_on_pdf(input_pdf_path, sku_locations, output_pdf_path, multi_sku_
                                         accumulated_width += 15  # Add bullet space
                                     content_elements_info.append((accumulated_line, current_line_font_size, current_line_font_size * 1.4))
                                     max_content_width_on_page = max(max_content_width_on_page, accumulated_width)
-                                
+
                                 # Start new line with current part
                                 current_line_parts = [part]
-                        
+
                         # Add remaining parts
                         if current_line_parts:
                             final_line = " / ".join(current_line_parts)
@@ -426,11 +596,11 @@ def stamp_skus_on_pdf(input_pdf_path, sku_locations, output_pdf_path, multi_sku_
                         # Split at spaces for non-pattern lines
                         words = line.split()
                         current_line_words = []
-                        
+
                         for word in words:
                             test_line = " ".join(current_line_words + [word])
                             test_width = fitz.get_text_length(test_line, fontname=font_name, fontsize=current_line_font_size)
-                            
+
                             if test_width <= max_width_for_text_area:
                                 current_line_words.append(word)
                             else:
@@ -442,10 +612,10 @@ def stamp_skus_on_pdf(input_pdf_path, sku_locations, output_pdf_path, multi_sku_
                                         accumulated_width += 15  # Add bullet space
                                     content_elements_info.append((accumulated_line, current_line_font_size, current_line_font_size * 1.4))
                                     max_content_width_on_page = max(max_content_width_on_page, accumulated_width)
-                                
+
                                 # Start new line with current word
                                 current_line_words = [word]
-                        
+
                         # Add remaining words
                         if current_line_words:
                             final_line = " ".join(current_line_words)
@@ -482,7 +652,7 @@ def stamp_skus_on_pdf(input_pdf_path, sku_locations, output_pdf_path, multi_sku_
                 current_y_cursor = top_margin_summary + summary_padding_y
                 if content_elements_info:
                     current_y_cursor += content_elements_info[0][1]
-                
+
                 for text_content, font_size_actual, element_height_taken in content_elements_info:
                     if text_content != title or not title:
                         # Check if this line should have a bullet (starts with "● ")
@@ -493,7 +663,7 @@ def stamp_skus_on_pdf(input_pdf_path, sku_locations, output_pdf_path, multi_sku_
                             bullet_y = current_y_cursor - (font_size_actual * 0.3)
                             bullet_center = fitz.Point(bullet_x, bullet_y)
                             page_obj.draw_circle(bullet_center, bullet_radius, color=(0, 0, 0), fill=(0, 0, 0))
-                            
+
                             # Insert text without the bullet symbol, with proper spacing
                             text_without_bullet = text_content[2:]  # Remove "● "
                             text_x = bullet_x + bullet_radius + 6
@@ -536,7 +706,7 @@ def stamp_skus_on_pdf(input_pdf_path, sku_locations, output_pdf_path, multi_sku_
                         bullet_y = current_y_cursor - (font_size_actual * 0.3)
                         bullet_center = fitz.Point(bullet_x, bullet_y)
                         page_obj.draw_circle(bullet_center, bullet_radius, color=(0, 0, 0), fill=(0, 0, 0))
-                        
+
                         # Insert text without the bullet symbol, with proper spacing
                         text_without_bullet = text_content[2:]  # Remove "● "
                         text_x = bullet_x + bullet_radius + 6
@@ -558,27 +728,27 @@ def stamp_skus_on_pdf(input_pdf_path, sku_locations, output_pdf_path, multi_sku_
                             set_simple=True
                         )
                     current_y_cursor -= element_height_taken
-        
+
         if global_aggregated_skus:
             summary_text_lines = []
             sorted_global_skus = sorted(global_aggregated_skus.items())
             for sku, total_qty in sorted_global_skus:
                 summary_text_lines.append(f"● {sku} (x{total_qty})")
-            
+
             # Create a special 2-column layout for All SKUs Summary page
             def add_two_column_all_skus_page(page_obj, lines_to_display, title=""):
                 # Calculate column dimensions
                 available_width = page_width - (2 * left_margin) - (2 * summary_padding_x)
                 column_width = (available_width - 20) / 2  # 20 points spacing between columns
-                
+
                 # Split lines into two columns
                 mid_point = len(lines_to_display) // 2
                 if len(lines_to_display) % 2 != 0:
                     mid_point += 1  # Put extra item in first column
-                
+
                 left_column_lines = lines_to_display[:mid_point]
                 right_column_lines = lines_to_display[mid_point:]
-                
+
                 # Calculate title dimensions
                 title_height = 0
                 if title:
@@ -588,20 +758,20 @@ def stamp_skus_on_pdf(input_pdf_path, sku_locations, output_pdf_path, multi_sku_
                         title_font_size_actual -= 0.5
                         title_text_width = fitz.get_text_length(title, fontname=font_name, fontsize=title_font_size_actual)
                     title_height = title_font_size_actual * 1.8
-                
+
                 # Calculate content height for background
                 max_column_height = max(len(left_column_lines), len(right_column_lines)) * (font_size * 1.4)
                 total_content_height = title_height + max_column_height + (2 * summary_padding_y)
-                
+
                 # Draw background
                 bg_rect_x0 = left_margin
                 bg_rect_x1 = left_margin + available_width + (2 * summary_padding_x)
                 bg_rect_y0 = top_margin_summary
                 bg_rect_y1 = top_margin_summary + total_content_height
-                
+
                 background_rect = fitz.Rect(bg_rect_x0, bg_rect_y0, bg_rect_x1, bg_rect_y1)
                 page_obj.draw_rect(background_rect, color=(0.9, 0.9, 0.9), fill=(0.9, 0.9, 0.9))
-                
+
                 # Draw title
                 current_y = top_margin_summary + summary_padding_y
                 if title:
@@ -615,11 +785,11 @@ def stamp_skus_on_pdf(input_pdf_path, sku_locations, output_pdf_path, multi_sku_
                         set_simple=True
                     )
                     current_y += title_font_size_actual * 0.8  # Add some spacing after title
-                
+
                 # Draw left column
                 left_column_x = left_margin + summary_padding_x
                 current_left_y = current_y + font_size
-                
+
                 for line in left_column_lines:
                     if line.startswith("● "):
                         # Draw bullet
@@ -628,7 +798,7 @@ def stamp_skus_on_pdf(input_pdf_path, sku_locations, output_pdf_path, multi_sku_
                         bullet_y = current_left_y - (font_size * 0.3)
                         bullet_center = fitz.Point(bullet_x, bullet_y)
                         page_obj.draw_circle(bullet_center, bullet_radius, color=(0, 0, 0), fill=(0, 0, 0))
-                        
+
                         # Draw text
                         text_without_bullet = line[2:]  # Remove "● "
                         text_x = bullet_x + bullet_radius + 6
@@ -650,11 +820,11 @@ def stamp_skus_on_pdf(input_pdf_path, sku_locations, output_pdf_path, multi_sku_
                             set_simple=True
                         )
                     current_left_y += font_size * 1.4
-                
+
                 # Draw right column
                 right_column_x = left_column_x + column_width + 20  # 20 points spacing
                 current_right_y = current_y + font_size
-                
+
                 for line in right_column_lines:
                     if line.startswith("● "):
                         # Draw bullet
@@ -663,7 +833,7 @@ def stamp_skus_on_pdf(input_pdf_path, sku_locations, output_pdf_path, multi_sku_
                         bullet_y = current_right_y - (font_size * 0.3)
                         bullet_center = fitz.Point(bullet_x, bullet_y)
                         page_obj.draw_circle(bullet_center, bullet_radius, color=(0, 0, 0), fill=(0, 0, 0))
-                        
+
                         # Draw text
                         text_without_bullet = line[2:]  # Remove "● "
                         text_x = bullet_x + bullet_radius + 6
@@ -689,7 +859,7 @@ def stamp_skus_on_pdf(input_pdf_path, sku_locations, output_pdf_path, multi_sku_
             # Check if all lines fit in one page with 2-column layout
             max_lines_per_page = int(available_content_height_per_page / (font_size * 1.4))
             max_lines_two_columns = max_lines_per_page * 2  # Since we have 2 columns
-            
+
             if len(summary_text_lines) <= max_lines_two_columns:
                 # All lines fit in one page with 2 columns
                 new_page = output_doc.new_page(width=page_width, height=page_height)
@@ -699,9 +869,9 @@ def stamp_skus_on_pdf(input_pdf_path, sku_locations, output_pdf_path, multi_sku_
                 current_summary_lines_buffer = []
                 current_buffer_height = 0
                 page_count = 0
-                
+
                 estimated_line_height_fixed = font_size * 1.4
-                
+
                 for line in summary_text_lines:
                     if current_buffer_height + estimated_line_height_fixed > available_content_height_per_page:
                         new_page = output_doc.new_page(width=page_width, height=page_height)
@@ -717,7 +887,7 @@ def stamp_skus_on_pdf(input_pdf_path, sku_locations, output_pdf_path, multi_sku_
                     else:
                         current_summary_lines_buffer.append(line)
                         current_buffer_height += estimated_line_height_fixed
-                
+
                 if current_summary_lines_buffer:
                     new_page = output_doc.new_page(width=page_width, height=page_height)
                     if page_count == 0:
@@ -729,15 +899,15 @@ def stamp_skus_on_pdf(input_pdf_path, sku_locations, output_pdf_path, multi_sku_
 
         # Multi-SKU Orders Pattern Summary
         multi_sku_pattern_counts = {}
-        
+
         # Track which pages we've already processed to avoid double-counting two-page orders
         processed_pages = set()
-        
+
         # Group SKUs by page and check for multi-SKU pages, handling two-page orders
         for page_num in range(doc.page_count):
             if page_num in processed_pages:
                 continue
-                
+
             if page_num in skus_by_page:
                 # Start with SKUs from current page
                 combined_sku_aggregated = {}
@@ -748,30 +918,39 @@ def stamp_skus_on_pdf(input_pdf_path, sku_locations, output_pdf_path, multi_sku_
                         combined_sku_aggregated[sku_text] += sku_quantity
                     else:
                         combined_sku_aggregated[sku_text] = sku_quantity
-                
+
                 # Check if this is a two-page order by looking at the next page
                 is_two_page_order = False
                 if page_num + 1 < doc.page_count:
-                    current_page_text = doc.load_page(page_num).get_text()
-                    next_page_text = doc.load_page(page_num + 1).get_text()
-                    
-                    # Check if current page has "Weight:" and next page doesn't
-                    if "Weight:" in current_page_text and "Weight:" not in next_page_text:
-                        is_two_page_order = True
-                        
-                        # Add SKUs from the next page to the combined aggregation
-                        if page_num + 1 in skus_by_page:
-                            for sku_info in skus_by_page[page_num + 1]:
-                                sku_text = sku_info['sku']
-                                sku_quantity = sku_info['quantity']
-                                if sku_text in combined_sku_aggregated:
-                                    combined_sku_aggregated[sku_text] += sku_quantity
-                                else:
-                                    combined_sku_aggregated[sku_text] = sku_quantity
-                        
-                        # Mark next page as processed so we don't count it separately
-                        processed_pages.add(page_num + 1)
-                
+                    current_page = safe_pdf_operation(doc.load_page, 3, page_num)
+                    next_page = safe_pdf_operation(doc.load_page, 3, page_num + 1)
+
+                    if current_page is not None and next_page is not None:
+                        current_page_text = safe_pdf_operation(current_page.get_text, 3)
+                        next_page_text = safe_pdf_operation(next_page.get_text, 3)
+
+                        # Check if current page has "Weight:" and next page doesn't
+                        if (current_page_text is not None and next_page_text is not None and
+                            "Weight:" in current_page_text and "Weight:" not in next_page_text):
+                            is_two_page_order = True
+
+                            # Add SKUs from the next page to the combined aggregation
+                            if page_num + 1 in skus_by_page:
+                                for sku_info in skus_by_page[page_num + 1]:
+                                    sku_text = sku_info['sku']
+                                    sku_quantity = sku_info['quantity']
+                                    if sku_text in combined_sku_aggregated:
+                                        combined_sku_aggregated[sku_text] += sku_quantity
+                                    else:
+                                        combined_sku_aggregated[sku_text] = sku_quantity
+
+                            # Mark next page as processed so we don't count it separately
+                            processed_pages.add(page_num + 1)
+
+                        # Free memory
+                        current_page = None
+                        next_page = None
+
                 # Check if this order (single or two-page) has more than one unique SKU
                 if len(combined_sku_aggregated) > 1:
                     # Create pattern string for this order
@@ -779,15 +958,15 @@ def stamp_skus_on_pdf(input_pdf_path, sku_locations, output_pdf_path, multi_sku_
                     pattern_parts = []
                     for sku, total_qty in sorted_order_skus:
                         pattern_parts.append(f"{sku} (x{total_qty})")
-                    
+
                     pattern = " / ".join(pattern_parts)
-                    
+
                     # Count this pattern
                     if pattern in multi_sku_pattern_counts:
                         multi_sku_pattern_counts[pattern] += 1
                     else:
                         multi_sku_pattern_counts[pattern] = 1
-                
+
                 # Mark current page as processed
                 processed_pages.add(page_num)
 
@@ -804,15 +983,15 @@ def stamp_skus_on_pdf(input_pdf_path, sku_locations, output_pdf_path, multi_sku_
             # Process lines with proper page break handling for wrapped content
             current_multi_sku_lines_buffer = []
             current_buffer_height = 0
-            
+
             # Define line height for calculations
             estimated_line_height_fixed = font_size * 1.4
-            
+
             for line in multi_sku_summary_lines:
                 # Calculate how many lines this entry will actually take after wrapping
                 max_width_for_text_area = page_width - (2 * left_margin) - (2 * summary_padding_x)
                 text_width = fitz.get_text_length(line, fontname=font_name, fontsize=font_size)
-                
+
                 # Estimate number of lines this entry will take
                 estimated_lines_for_this_entry = 1
                 if text_width > max_width_for_text_area:
@@ -821,35 +1000,35 @@ def stamp_skus_on_pdf(input_pdf_path, sku_locations, output_pdf_path, multi_sku_
                         parts = line.split(" / ")
                         current_test_parts = []
                         line_count = 0
-                        
+
                         for part in parts:
                             test_line = " / ".join(current_test_parts + [part])
                             test_width = fitz.get_text_length(test_line, fontname=font_name, fontsize=font_size)
-                            
+
                             if test_width <= max_width_for_text_area:
                                 current_test_parts.append(part)
                             else:
                                 if current_test_parts:
                                     line_count += 1
                                 current_test_parts = [part]
-                        
+
                         if current_test_parts:
                             line_count += 1
-                        
+
                         estimated_lines_for_this_entry = max(1, line_count)
                     else:
                         # Estimate based on character count for word wrapping
                         estimated_lines_for_this_entry = max(1, int(text_width / max_width_for_text_area) + 1)
-                
+
                 estimated_height_for_this_entry = estimated_lines_for_this_entry * estimated_line_height_fixed
-                
+
                 # Check if adding this entry would exceed page height
                 if current_buffer_height + estimated_height_for_this_entry > available_content_height_per_page:
                     # Create page with current buffer
                     if current_multi_sku_lines_buffer:
                         new_page = output_doc.new_page(width=page_width, height=page_height)
                         add_new_summary_page_content(new_page, current_multi_sku_lines_buffer, "--- Mix Orders Patterns ---", position_top=True)
-                    
+
                     # Start new page with current line
                     current_multi_sku_lines_buffer = [line]
                     current_buffer_height = estimated_height_for_this_entry
@@ -857,7 +1036,7 @@ def stamp_skus_on_pdf(input_pdf_path, sku_locations, output_pdf_path, multi_sku_
                     # Add to current buffer
                     current_multi_sku_lines_buffer.append(line)
                     current_buffer_height += estimated_height_for_this_entry
-            
+
             # Create final page if there's remaining content
             if current_multi_sku_lines_buffer:
                 new_page = output_doc.new_page(width=page_width, height=page_height)
@@ -867,16 +1046,16 @@ def stamp_skus_on_pdf(input_pdf_path, sku_locations, output_pdf_path, multi_sku_
         if multi_sku_pattern_counts:
             # Aggregate SKU counts from all multi-SKU patterns
             multi_sku_count_aggregated = {}
-            
+
             for pattern, occurrence_count in multi_sku_pattern_counts.items():
                 # Parse the pattern to extract individual SKUs and their quantities
                 # Pattern format: "BWL (x1) / BWM (x1) - 44 orders"
                 # Remove the order count part first
                 pattern_without_count = pattern.split(" - ")[0] if " - " in pattern else pattern
-                
+
                 # Split by " / " to get individual SKU parts
                 sku_parts = pattern_without_count.split(" / ")
-                
+
                 for sku_part in sku_parts:
                     # Extract SKU name and quantity from format "BWL (x1)"
                     if " (x" in sku_part and sku_part.endswith(")"):
@@ -886,14 +1065,14 @@ def stamp_skus_on_pdf(input_pdf_path, sku_locations, output_pdf_path, multi_sku_
                             sku_quantity = int(quantity_str)
                             # Multiply by the number of times this pattern occurred
                             total_sku_quantity = sku_quantity * occurrence_count
-                            
+
                             if sku_name in multi_sku_count_aggregated:
                                 multi_sku_count_aggregated[sku_name] += total_sku_quantity
                             else:
                                 multi_sku_count_aggregated[sku_name] = total_sku_quantity
                         except ValueError:
                             continue  # Skip if quantity parsing fails
-            
+
             # Create Multi-SKU Orders SKU Count summary page if there are any counts
             if multi_sku_count_aggregated:
                 multi_sku_count_lines = []
@@ -906,15 +1085,15 @@ def stamp_skus_on_pdf(input_pdf_path, sku_locations, output_pdf_path, multi_sku_
                     # Calculate column dimensions
                     available_width = page_width - (2 * left_margin) - (2 * summary_padding_x)
                     column_width = (available_width - 20) / 2  # 20 points spacing between columns
-                    
+
                     # Split lines into two columns
                     mid_point = len(lines_to_display) // 2
                     if len(lines_to_display) % 2 != 0:
                         mid_point += 1  # Put extra item in first column
-                    
+
                     left_column_lines = lines_to_display[:mid_point]
                     right_column_lines = lines_to_display[mid_point:]
-                    
+
                     # Calculate title dimensions
                     title_height = 0
                     if title:
@@ -924,20 +1103,20 @@ def stamp_skus_on_pdf(input_pdf_path, sku_locations, output_pdf_path, multi_sku_
                             title_font_size_actual -= 0.5
                             title_text_width = fitz.get_text_length(title, fontname=font_name, fontsize=title_font_size_actual)
                         title_height = title_font_size_actual * 1.8
-                    
+
                     # Calculate content height for background
                     max_column_height = max(len(left_column_lines), len(right_column_lines)) * (font_size * 1.4)
                     total_content_height = title_height + max_column_height + (2 * summary_padding_y)
-                    
+
                     # Draw background
                     bg_rect_x0 = left_margin
                     bg_rect_x1 = left_margin + available_width + (2 * summary_padding_x)
                     bg_rect_y0 = top_margin_summary
                     bg_rect_y1 = top_margin_summary + total_content_height
-                    
+
                     background_rect = fitz.Rect(bg_rect_x0, bg_rect_y0, bg_rect_x1, bg_rect_y1)
                     page_obj.draw_rect(background_rect, color=(0.9, 0.9, 0.9), fill=(0.9, 0.9, 0.9))
-                    
+
                     # Draw title
                     current_y = top_margin_summary + summary_padding_y
                     if title:
@@ -951,11 +1130,11 @@ def stamp_skus_on_pdf(input_pdf_path, sku_locations, output_pdf_path, multi_sku_
                             set_simple=True
                         )
                         current_y += title_font_size_actual * 0.8  # Add some spacing after title
-                    
+
                     # Draw left column
                     left_column_x = left_margin + summary_padding_x
                     current_left_y = current_y + font_size
-                    
+
                     for line in left_column_lines:
                         if line.startswith("● "):
                             # Draw bullet
@@ -964,7 +1143,7 @@ def stamp_skus_on_pdf(input_pdf_path, sku_locations, output_pdf_path, multi_sku_
                             bullet_y = current_left_y - (font_size * 0.3)
                             bullet_center = fitz.Point(bullet_x, bullet_y)
                             page_obj.draw_circle(bullet_center, bullet_radius, color=(0, 0, 0), fill=(0, 0, 0))
-                            
+
                             # Draw text
                             text_without_bullet = line[2:]  # Remove "● "
                             text_x = bullet_x + bullet_radius + 6
@@ -986,11 +1165,11 @@ def stamp_skus_on_pdf(input_pdf_path, sku_locations, output_pdf_path, multi_sku_
                                 set_simple=True
                             )
                         current_left_y += font_size * 1.4
-                    
+
                     # Draw right column
                     right_column_x = left_column_x + column_width + 20  # 20 points spacing
                     current_right_y = current_y + font_size
-                    
+
                     for line in right_column_lines:
                         if line.startswith("● "):
                             # Draw bullet
@@ -999,7 +1178,7 @@ def stamp_skus_on_pdf(input_pdf_path, sku_locations, output_pdf_path, multi_sku_
                             bullet_y = current_right_y - (font_size * 0.3)
                             bullet_center = fitz.Point(bullet_x, bullet_y)
                             page_obj.draw_circle(bullet_center, bullet_radius, color=(0, 0, 0), fill=(0, 0, 0))
-                            
+
                             # Draw text
                             text_without_bullet = line[2:]  # Remove "● "
                             text_x = bullet_x + bullet_radius + 6
@@ -1025,10 +1204,10 @@ def stamp_skus_on_pdf(input_pdf_path, sku_locations, output_pdf_path, multi_sku_
                 # Check if all lines fit in one page with 2-column layout
                 max_lines_per_page = int(available_content_height_per_page / (font_size * 1.4))
                 max_lines_two_columns = max_lines_per_page * 2  # Since we have 2 columns
-                
+
                 # Define line height for calculations
                 estimated_line_height_fixed = font_size * 1.4
-                
+
                 if len(multi_sku_count_lines) <= max_lines_two_columns:
                     # All lines fit in one page with 2 columns
                     new_page = output_doc.new_page(width=page_width, height=page_height)
@@ -1038,7 +1217,7 @@ def stamp_skus_on_pdf(input_pdf_path, sku_locations, output_pdf_path, multi_sku_
                     current_multi_sku_count_buffer = []
                     current_buffer_height = 0
                     page_count = 0
-                    
+
                     for line in multi_sku_count_lines:
                         if current_buffer_height + estimated_line_height_fixed > available_content_height_per_page:
                             new_page = output_doc.new_page(width=page_width, height=page_height)
@@ -1054,7 +1233,7 @@ def stamp_skus_on_pdf(input_pdf_path, sku_locations, output_pdf_path, multi_sku_
                         else:
                             current_multi_sku_count_buffer.append(line)
                             current_buffer_height += estimated_line_height_fixed
-                    
+
                     if current_multi_sku_count_buffer:
                         new_page = output_doc.new_page(width=page_width, height=page_height)
                         if page_count == 0:
@@ -1064,10 +1243,16 @@ def stamp_skus_on_pdf(input_pdf_path, sku_locations, output_pdf_path, multi_sku_
                             # Final page uses regular layout
                             add_new_summary_page_content(new_page, current_multi_sku_count_buffer, "--- Mix Orders SKU Count (continued) ---", position_top=True)
 
-                
-        output_doc.save(output_pdf_path)
+
+        # Use safe save function for PythonAnywhere compatibility
+        save_success = safe_file_save(output_doc, output_pdf_path)
         output_doc.close()
         doc.close()
+
+        if not save_success:
+            print(f"Failed to save PDF to: {output_pdf_path}")
+            return False
+
         return True
     except Exception as e:
         print(f"An error occurred during PDF stamping: {e}")
@@ -1112,7 +1297,15 @@ def main(file_name=None):
         return
 
     base_name = os.path.splitext(os.path.basename(pdf_file_path))[0]
-    output_pdf_path = f"{base_name}_SKUs_Qty_EndPage.pdf"
+
+    # When running from command line, save output in the project root directory
+    # Get the directory where this script is located (src folder)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    # Get the parent directory (project root)
+    project_root = os.path.dirname(script_dir)
+    # Create output path in project root
+    output_pdf_path = os.path.join(project_root, f"{base_name}_SKUs_Qty_EndPage.pdf")
+
     print(f"Output PDF will be saved as: {output_pdf_path}")
 
     sku_locations = extract_sku_locations_from_pdf(pdf_file_path)
@@ -1143,7 +1336,7 @@ def main(file_name=None):
         unique_skus_in_order = set(sku_info['sku'] for sku_info in skus_list)
         if len(unique_skus_in_order) > 1:
             filtered_multi_sku_orders[order_id] = skus_list
-    
+
     print(f"\nStamping them onto a new PDF...")
 
     if stamp_skus_on_pdf(pdf_file_path, sku_locations, output_pdf_path, filtered_multi_sku_orders):
